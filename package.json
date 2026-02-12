@@ -1,0 +1,33 @@
+{
+  "name": "backend",
+  "private": true,
+  "module": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "bun run index.js",
+    "dev": "bun --watch index.js",
+    "build": "bun install"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "bcryptjs": "^3.0.3",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "crypto": "^1.0.1",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.2.1",
+    "express-xss-sanitizer": "^2.0.1",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.1.5",
+    "multer": "^2.0.2",
+    "pretier": "^0.0.1"
+  }
+}
