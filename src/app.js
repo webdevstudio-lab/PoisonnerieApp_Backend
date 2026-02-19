@@ -20,6 +20,9 @@ import categoryRouter from "./routes/categoryDepense.routes.js";
 import depenseRouter from "./routes/depense.routes.js";
 import achatRouter from "./routes/achat.routes.js";
 import historyStockRouter from "./routes/stockHistory.routes.js";
+import caisseRouter from "./routes/caisse.routes.js";
+import versementRouter from "./routes/versement.routes.js";
+import dashboardRouter from "./routes/dashboard.routes.js";
 
 const app = express();
 
@@ -67,6 +70,9 @@ app.use("/api/categories", protect, categoryRouter);
 app.use("/api/depenses", protect, depenseRouter);
 app.use("/api/achats", protect, achatRouter);
 app.use("/api/stock-history", protect, historyStockRouter);
+app.use("/api/caisse", protect, caisseRouter);
+app.use("/api/versements", protect, versementRouter);
+app.use("/api/dashboard", protect, dashboardRouter);
 
 // Gestion des routes inexistantes (404)
 app.use((req, res) => {

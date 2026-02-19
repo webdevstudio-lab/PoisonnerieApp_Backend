@@ -1,18 +1,25 @@
 import mongoose from "mongoose";
-import { Store, Product, StockHistory } from "../databases/index.database.js";
+import {
+  Store,
+  Product,
+  StockHistory,
+  Sale,
+  TransferSale,
+} from "../databases/index.database.js";
 import responseHandler from "../utils/responseHandler.js";
 
-// 1. Créer un nouvel entrepôt / chambre froide
+/**
+ * 1. CRÉER UN NOUVEAU DÉPÔT
+ */
 export const addStore = async (req, res) => {
   try {
     const { name, salePoint, type, items } = req.body;
 
-    // Vérification si un store de ce type existe déjà pour ce point de vente
     const existingStore = await Store.findOne({ salePoint, type });
     if (existingStore) {
       return responseHandler.error(
         res,
-        `Un dépôt de type ${type} existe déjà pour ce point de vente.`,
+        `Un dépôt de type ${type} existe déjà.`,
         400,
       );
     }
@@ -27,34 +34,78 @@ export const addStore = async (req, res) => {
     await newStore.save();
     return responseHandler.created(res, newStore, "Dépôt créé avec succès");
   } catch (error) {
-    return responseHandler.error(
-      res,
-      "Erreur lors de la création du dépôt",
-      500,
-      error.message,
-    );
+    return responseHandler.error(res, "Erreur création", 500, error.message);
   }
 };
 
-// 2. Récupérer l'état de tous les stocks
+/**
+ * 2. RÉCUPÉRER TOUS LES DÉPÔTS (Populate mis à jour)
+ */
 export const getAllStores = async (req, res) => {
   try {
     const stores = await Store.find()
       .populate("salePoint", "name location")
-      .populate("items.product", "name category sellingPrice");
+      .populate("items.product", "name category sellingPrice purchasePrice"); // <--- AJOUTÉ
 
     return responseHandler.ok(res, stores);
   } catch (error) {
     return responseHandler.error(
       res,
-      "Erreur de récupération",
+      "Erreur récupération",
       500,
       error.message,
     );
   }
 };
 
-// 3. Mettre à jour les infos générales
+/**
+ * 3. RÉCUPÉRER UN DÉPÔT SPÉCIFIQUE (Crucial pour StorageDetails)
+ */
+export const getStoreById = async (req, res) => {
+  try {
+    const store = await Store.findById(req.params.id)
+      .populate({
+        path: "items.product",
+        select: "name category sellingPrice purchasePrice unit", // <--- AJOUTÉ
+      })
+      .populate("salePoint");
+
+    if (!store) return responseHandler.notFound(res, "Dépôt introuvable");
+    return responseHandler.ok(res, store);
+  } catch (error) {
+    return responseHandler.error(res, "Erreur détails", 500, error.message);
+  }
+};
+
+/**
+ * Récupérer le stock à partir de l'ID de la boutique
+ */
+export const getStoreBySalePoint = async (req, res) => {
+  try {
+    const { salePointId } = req.params;
+    const store = await Store.findOne({
+      salePoint: salePointId,
+      type: "secondaire",
+    }).populate("items.product", "name category sellingPrice purchasePrice"); // <--- AJOUTÉ
+
+    if (!store) {
+      return responseHandler.error(res, "Aucun stock trouvé", 404);
+    }
+
+    return responseHandler.ok(res, store);
+  } catch (error) {
+    return responseHandler.error(
+      res,
+      "Erreur récupération",
+      500,
+      error.message,
+    );
+  }
+};
+
+/**
+ * 4. METTRE À JOUR LES INFOS DU DÉPÔT
+ */
 export const updateStore = async (req, res) => {
   try {
     const { id } = req.params;
@@ -66,33 +117,15 @@ export const updateStore = async (req, res) => {
 
     if (!updatedStore)
       return responseHandler.notFound(res, "Dépôt introuvable");
-
-    return responseHandler.ok(res, updatedStore, "Dépôt mis à jour");
+    return responseHandler.ok(res, updatedStore, "Mise à jour réussie");
   } catch (error) {
     return responseHandler.error(res, "Erreur mise à jour", 500, error.message);
   }
 };
 
-// 4. Récupérer le stock d'un dépôt spécifique
-export const getStoreById = async (req, res) => {
-  try {
-    const store = await Store.findById(req.params.id)
-      .populate("items.product")
-      .populate("salePoint");
-
-    if (!store) return responseHandler.notFound(res, "Dépôt introuvable");
-    return responseHandler.ok(res, store);
-  } catch (error) {
-    return responseHandler.error(
-      res,
-      "Erreur de récupération",
-      500,
-      error.message,
-    );
-  }
-};
-
-// 5. Supprimer un dépôt
+/**
+ * 5. SUPPRIMER UN DÉPÔT
+ */
 export const deleteStore = async (req, res) => {
   try {
     const store = await Store.findById(req.params.id);
@@ -105,7 +138,7 @@ export const deleteStore = async (req, res) => {
     if (totalStock > 0) {
       return responseHandler.error(
         res,
-        "Impossible de supprimer un dépôt contenant encore du stock",
+        "Le dépôt doit être vide avant suppression",
         400,
       );
     }
@@ -118,77 +151,113 @@ export const deleteStore = async (req, res) => {
 };
 
 /**
- * TRANSFERER DU STOCK (Correction de la mise à jour des quantités)
+ * 6. TRANSFERT MULTI-PRODUITS
  */
 export const transferStock = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
   try {
-    const { fromStoreId, toStoreId, productId, quantityCartons } = req.body;
-    const qty = Number(quantityCartons);
+    const { fromStoreId, toStoreId, products } = req.body;
     const userId = req.user?._id;
 
-    if (qty <= 0) throw new Error("La quantité doit être supérieure à 0.");
+    if (!products || products.length === 0)
+      throw new Error("Aucun produit sélectionné.");
 
-    // 1. Vérification et chargement
-    const product = await Product.findById(productId).session(session);
     const sourceStore = await Store.findById(fromStoreId).session(session);
     const destStore = await Store.findById(toStoreId).session(session);
 
-    if (!product || !sourceStore || !destStore)
-      throw new Error("Produit ou Dépôt introuvable.");
+    if (!sourceStore || !destStore) throw new Error("Dépôts introuvables.");
 
-    // 2. Débiter le stock source (Opérateur positionnel $)
-    const sourceUpdate = await Store.updateOne(
-      {
-        _id: fromStoreId,
-        "items.product": productId,
-        "items.quantityCartons": { $gte: qty },
-      },
-      { $inc: { "items.$.quantityCartons": -qty } },
-      { session },
-    );
+    let totalTransferAmount = 0;
+    const transferItemsForSale = [];
+    const historyEntries = [];
 
-    if (sourceUpdate.modifiedCount === 0)
-      throw new Error(
-        "Stock insuffisant ou produit non trouvé dans le dépôt source.",
+    for (const item of products) {
+      const { productId, qty } = item;
+      const quantity = Number(qty);
+      if (quantity <= 0) continue;
+
+      const product = await Product.findById(productId).session(session);
+      if (!product) throw new Error(`Produit ${productId} non trouvé.`);
+
+      // Débit Source
+      const sourceUpdate = await Store.updateOne(
+        {
+          _id: fromStoreId,
+          "items.product": productId,
+          "items.quantityCartons": { $gte: quantity },
+        },
+        { $inc: { "items.$.quantityCartons": -quantity } },
+        { session },
       );
+      if (sourceUpdate.modifiedCount === 0)
+        throw new Error(`Stock insuffisant : ${product.name}`);
 
-    // 3. Créditer le stock destination
-    const destUpdate = await Store.updateOne(
-      { _id: toStoreId, "items.product": productId },
-      { $inc: { "items.$.quantityCartons": qty } },
-      { session },
-    );
+      // Crédit Destination
+      const destUpdate = await Store.updateOne(
+        { _id: toStoreId, "items.product": productId },
+        { $inc: { "items.$.quantityCartons": quantity } },
+        { session },
+      );
+      if (destUpdate.matchedCount === 0) {
+        await Store.updateOne(
+          { _id: toStoreId },
+          {
+            $push: { items: { product: productId, quantityCartons: quantity } },
+          },
+          { session },
+        );
+      }
 
-    // Si le produit n'existe pas encore dans le dépôt de destination, on l'ajoute
-    if (destUpdate.matchedCount === 0) {
-      await Store.updateOne(
-        { _id: toStoreId },
-        { $push: { items: { product: productId, quantityCartons: qty } } },
+      // Calcul Dette (Basé sur SellingPrice)
+      if (sourceStore.type === "principal" && destStore.type === "secondaire") {
+        const subTotal = quantity * product.sellingPrice;
+        totalTransferAmount += subTotal;
+        transferItemsForSale.push({
+          product: productId,
+          quantityCartons: quantity,
+          unitPrice: product.sellingPrice,
+          subTotal: subTotal,
+        });
+      }
+
+      historyEntries.push({
+        product: productId,
+        fromStore: fromStoreId,
+        toStore: toStoreId,
+        quantity: quantity,
+        type: sourceStore.type === "secondaire" ? "retour" : "transfert",
+        description: `Mouvement de ${quantity} ctn de ${product.name}`,
+        userId,
+        date: new Date(),
+      });
+    }
+
+    const savedHistories = await StockHistory.insertMany(historyEntries, {
+      session,
+    });
+
+    if (
+      sourceStore.type === "principal" &&
+      destStore.type === "secondaire" &&
+      totalTransferAmount > 0
+    ) {
+      const newTransferSale = new TransferSale({
+        salePoint: destStore.salePoint,
+        stockMovementId: savedHistories[0]._id,
+        items: transferItemsForSale,
+        totalAmount: totalTransferAmount,
+      });
+      await newTransferSale.save({ session });
+
+      await Sale.findByIdAndUpdate(
+        destStore.salePoint,
+        { $inc: { totalDebtToOwner: totalTransferAmount } },
         { session },
       );
     }
 
-    // 4. Historique
-    const movementType =
-      sourceStore.type === "secondaire" && destStore.type === "principal"
-        ? "retour"
-        : "transfert";
-    const history = new StockHistory({
-      product: productId,
-      fromStore: fromStoreId,
-      toStore: toStoreId,
-      quantity: qty,
-      type: movementType,
-      description: `${movementType === "retour" ? "Retour" : "Transfert"} de ${qty} carton(s) de ${product.name} de ${sourceStore.name} vers ${destStore.name}`,
-      userId: userId,
-      date: new Date(),
-    });
-
-    await history.save({ session });
     await session.commitTransaction();
-
     return responseHandler.ok(res, null, "Transfert effectué avec succès");
   } catch (error) {
     await session.abortTransaction();
@@ -199,25 +268,19 @@ export const transferStock = async (req, res) => {
 };
 
 /**
- * DECLARER UNE PERTE
+ * 7. DÉCLARER UNE PERTE
  */
 export const declareLoss = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
   try {
-    const { id } = req.params; // Store ID
+    const { id } = req.params;
     const { productId, quantityCartons, reason } = req.body;
     const qty = Number(quantityCartons);
-    const userId = req.user?._id;
-
-    if (qty <= 0) throw new Error("Quantité invalide.");
 
     const product = await Product.findById(productId).session(session);
-    const store = await Store.findById(id).session(session);
+    if (!product) throw new Error("Produit introuvable.");
 
-    if (!product || !store) throw new Error("Produit ou Dépôt introuvable.");
-
-    // Mettre à jour le stock (Soustraction)
     const updateResult = await Store.updateOne(
       {
         _id: id,
@@ -228,24 +291,20 @@ export const declareLoss = async (req, res) => {
       { session },
     );
 
-    if (updateResult.modifiedCount === 0)
-      throw new Error("Stock insuffisant pour déclarer cette perte.");
+    if (updateResult.modifiedCount === 0) throw new Error("Stock insuffisant.");
 
-    // Créer l'historique
-    const history = new StockHistory({
+    await new StockHistory({
       product: productId,
       fromStore: id,
       quantity: qty,
       type: "perte",
-      description: `Perte : ${qty} carton(s) de ${product.name} (${store.name}). Motif: ${reason}`,
-      userId: userId,
+      description: `PERTE: ${qty} ctn (${reason})`,
+      userId: req.user?._id,
       date: new Date(),
-    });
+    }).save({ session });
 
-    await history.save({ session });
     await session.commitTransaction();
-
-    return responseHandler.ok(res, null, `Perte enregistrée : ${reason}`);
+    return responseHandler.ok(res, null, "Perte enregistrée");
   } catch (error) {
     await session.abortTransaction();
     return responseHandler.error(res, error.message, 400);

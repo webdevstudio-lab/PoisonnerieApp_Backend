@@ -10,6 +10,11 @@ import { CategoryDepense } from "./models/CategoryDepense.js";
 import { Depense } from "./models/Depense.js";
 import { Purchase } from "./models/Achat.model.js";
 import { StockHistory } from "./models/StockHistory.model.js";
+import { ClientTransaction } from "./models/ClientTransaction.model.js";
+import { OwnerPayment } from "./models/VersmSale.model.js";
+import { TransferSale } from "./models/VentePrincipal.model.js";
+import { HistoriqueCaisseGenerale } from "./models/HistoriqueCaisseGenerale.model.js";
+import { CaisseGenerale } from "./models/CaisseGeneral.model.js";
 
 export {
   User,
@@ -24,4 +29,9 @@ export {
   Depense,
   Purchase,
   StockHistory,
+  ClientTransaction,
+  OwnerPayment,
+  TransferSale,
+  HistoriqueCaisseGenerale,
+  CaisseGenerale,
 };

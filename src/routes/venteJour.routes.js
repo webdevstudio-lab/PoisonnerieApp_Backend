@@ -1,30 +1,33 @@
 import { Router } from "express";
 import {
   addVenteJour,
-  getHistoryByPoint,
-  updateVenteDuJour,
-  deleteVenteDuJour,
-  deleteAllVenteDuJour,
+  getVentesByStore,
+  updateVenteJour,
+  deleteVenteJour,
+  getVenteStats,
 } from "../controllers/venteJour.controller.js";
 
-const venteDuJourRouter = Router();
+const venteJourRouter = Router();
 
-// --- Routes pour les bilans de vente ---
+// --- CRÉATION ---
+// Enregistrer une nouvelle vente
+venteJourRouter.post("/", addVenteJour);
 
-// Enregistrer un nouveau bilan (fin de journée ou partiel)
-venteDuJourRouter.post("/", addVenteJour);
+// --- LECTURE ---
+// Récupérer les ventes par boutique (stock secondaire)
+venteJourRouter.get("/store/:storeId", getVentesByStore);
 
-// Récupérer l'historique des bilans d'un point de vente spécifique
-// Usage: /api/ventes/point/ID_DU_POINT
-venteDuJourRouter.get("/point/:pointId", getHistoryByPoint);
+// Récupérer les ventes par point de vente (alias utilisant la même logique de filtre)
+venteJourRouter.get("/point/:salePointId", getVentesByStore);
 
-// Modifier un bilan existant (réajuste automatiquement les stocks)
-venteDuJourRouter.put("/:id", updateVenteDuJour);
+// --- MODIFICATION ---
+// Mettre à jour une vente (ajustement stock et solde inclus)
+venteJourRouter.patch("/:id", updateVenteJour);
 
-// Supprimer un bilan précis (restaure les stocks)
-venteDuJourRouter.delete("/:id", deleteVenteDuJour);
+// --- SUPPRESSION ---
+// Supprimer une vente (restauration stock et solde incluse)
+venteJourRouter.delete("/:id", deleteVenteJour);
 
-// Supprimer TOUS les bilans (Attention : action irréversible)
-venteDuJourRouter.delete("/danger/all", deleteAllVenteDuJour);
+venteJourRouter.get("/stats/:salePointId", getVenteStats);
 
-export default venteDuJourRouter;
+export default venteJourRouter;

@@ -4,8 +4,14 @@ import responseHandler from "../utils/responseHandler.js";
 // 1. Ajouter un produit au catalogue global
 export const addProduct = async (req, res) => {
   try {
-    const { name, category, weightPerCarton, lowStockThreshold, sellingPrice } =
-      req.body;
+    const {
+      name,
+      category,
+      weightPerCarton,
+      lowStockThreshold,
+      sellingPrice,
+      purchasePrice,
+    } = req.body;
 
     const existingProduct = await Product.findOne({ name: name.trim() });
     if (existingProduct) {
@@ -16,7 +22,8 @@ export const addProduct = async (req, res) => {
       name: name.trim(),
       category,
       weightPerCarton: Number(weightPerCarton),
-      sellingPrice: Number(sellingPrice || 0), // Ajout du prix de vente
+      purchasePrice: Number(purchasePrice || 0), // <--- AJOUTÉ
+      sellingPrice: Number(sellingPrice || 0),
       lowStockThreshold: Number(lowStockThreshold || 5),
     });
 
@@ -67,7 +74,7 @@ export const getOneProduct = async (req, res) => {
   }
 };
 
-// 4. Mise à jour (incluant le prix de vente)
+// 4. Mise à jour (incluant le prix d'achat et de vente)
 export const updateProduct = async (req, res) => {
   try {
     const { id } = req.params;
@@ -77,7 +84,6 @@ export const updateProduct = async (req, res) => {
     });
 
     if (!product) return responseHandler.notFound(res, "Produit introuvable");
-
     return responseHandler.ok(res, product, "Référence produit mise à jour");
   } catch (error) {
     return responseHandler.error(

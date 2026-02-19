@@ -1,16 +1,18 @@
 import {
   Store,
-  Supplier,
   Purchase,
   Depense,
   CategoryDepense,
+  CaisseGenerale,
+  HistoriqueCaisseGenerale,
+  Product,
 } from "../databases/index.database.js";
 import responseHandler from "../utils/responseHandler.js";
 import mongoose from "mongoose";
 
 /**
  * 1. ENREGISTRER UN NOUVEL ACHAT
- * - Crée l'achat, met à jour le stock, ajuste le solde fournisseur et crée une dépense.
+ * Utilise unitPurchasePrice pour le calcul de sortie de caisse.
  */
 export const addAchat = async (req, res) => {
   const session = await mongoose.startSession();
@@ -20,24 +22,21 @@ export const addAchat = async (req, res) => {
     const { supplierId, storeId, items, description, buyerId } = req.body;
     const finalBuyerId = req.user?._id || buyerId;
 
-    if (!finalBuyerId) throw new Error("ID acheteur manquant.");
-
-    // Récupération des infos fournisseur et boutique pour le libellé
-    const [supplier, store] = await Promise.all([
-      Supplier.findById(supplierId).session(session),
-      Store.findById(storeId).session(session),
-    ]);
-
-    // Gestion automatique de la catégorie de dépense
-    const category = await CategoryDepense.findOneAndUpdate(
-      { name: "ACHAT DE MARCHANDISES" },
-      {
-        $setOnInsert: { color: "#EF4444", description: "Achats marchandises" },
-      },
-      { upsert: true, new: true, session },
+    // Calcul du total basé sur les prix d'achat fournis
+    const totalAchat = items.reduce(
+      (acc, item) =>
+        acc + Number(item.quantity) * Number(item.unitPurchasePrice),
+      0,
     );
 
-    // Création de l'objet Achat
+    const caisse = await CaisseGenerale.findOne().session(session);
+    if (!caisse || caisse.soldeActuel < totalAchat) {
+      throw new Error(
+        `Solde caisse insuffisant (${caisse?.soldeActuel || 0} FCFA disponibles)`,
+      );
+    }
+
+    // Création de l'achat
     const newPurchase = new Purchase({
       supplier: supplierId,
       destinedStore: storeId,
@@ -49,33 +48,31 @@ export const addAchat = async (req, res) => {
       buyer: finalBuyerId,
       description: description || "Ravitaillement",
     });
-
     await newPurchase.save({ session });
 
-    // Création de la dépense financière liée
-    const newDepense = new Depense({
-      label: `Achat chez ${supplier?.name || "Fournisseur"}`,
-      amount: newPurchase.totalAmount,
-      category: category._id,
-      user: finalBuyerId,
-      note: `ACHAT #${newPurchase._id.toString().slice(-6).toUpperCase()}`,
-      date: new Date(),
-    });
-    await newDepense.save({ session });
+    // Mouvement Caisse (SORTIE)
+    caisse.soldeActuel -= totalAchat;
+    caisse.totalSorties += totalAchat;
+    await caisse.save({ session });
 
-    // Lier la dépense à l'achat
-    newPurchase.depenseId = newDepense._id;
-    await newPurchase.save({ session });
+    await new HistoriqueCaisseGenerale({
+      type: "SORTIE",
+      categorie: "DEPENSE",
+      montant: totalAchat,
+      soldeApresOperation: caisse.soldeActuel,
+      achatRef: newPurchase._id,
+      description: `Achat marchandises - RÉF: ${newPurchase._id.toString().slice(-6).toUpperCase()}`,
+      effectuePar: finalBuyerId,
+    }).save({ session });
 
-    // Mise à jour des stocks (Logic Upsert)
+    // Mise à jour des Stocks (Uniquement quantités)
     for (const item of items) {
-      const updateRes = await Store.updateOne(
+      const resUpdate = await Store.updateOne(
         { _id: storeId, "items.product": item.productId },
         { $inc: { "items.$.quantityCartons": Number(item.quantity) } },
         { session },
       );
-
-      if (updateRes.matchedCount === 0) {
+      if (resUpdate.matchedCount === 0) {
         await Store.updateOne(
           { _id: storeId },
           {
@@ -91,12 +88,23 @@ export const addAchat = async (req, res) => {
       }
     }
 
-    // Mise à jour du solde dû au fournisseur
-    await Supplier.findByIdAndUpdate(
-      supplierId,
-      { $inc: { balance: newPurchase.totalAmount } },
-      { session },
+    // Création de la Dépense Financière
+    const category = await CategoryDepense.findOneAndUpdate(
+      { name: "ACHAT DE MARCHANDISES" },
+      { $setOnInsert: { color: "#EF4444" } },
+      { upsert: true, new: true, session },
     );
+
+    const newDepense = await new Depense({
+      label: `Achat Marchandises`,
+      amount: totalAchat,
+      category: category._id,
+      user: finalBuyerId,
+      note: `ACHAT RÉF: ${newPurchase._id.toString().slice(-6).toUpperCase()}`,
+    }).save({ session });
+
+    newPurchase.depenseId = newDepense._id;
+    await newPurchase.save({ session });
 
     await session.commitTransaction();
     return responseHandler.created(
@@ -106,32 +114,25 @@ export const addAchat = async (req, res) => {
     );
   } catch (error) {
     await session.abortTransaction();
-    return responseHandler.error(
-      res,
-      "Erreur lors de l'achat",
-      500,
-      error.message,
-    );
+    return responseHandler.error(res, error.message, 500);
   } finally {
     session.endSession();
   }
 };
 
 /**
- * 2. RÉCUPÉRER TOUS LES ACHATS (Liste globale)
+ * 2. RÉCUPÉRER TOUS LES ACHATS
  */
 export const getAllAchat = async (req, res) => {
   try {
     const achats = await Purchase.find()
-      .populate("supplier", "name")
-      .populate("buyer", "name")
-      .populate("destinedStore", "name")
+      .populate("supplier buyer destinedStore")
       .sort({ createdAt: -1 });
     return responseHandler.ok(res, achats);
   } catch (error) {
     return responseHandler.error(
       res,
-      "Erreur de récupération",
+      "Erreur récupération",
       500,
       error.message,
     );
@@ -143,27 +144,18 @@ export const getAllAchat = async (req, res) => {
  */
 export const getOneAchat = async (req, res) => {
   try {
-    const achat = await Purchase.findById(req.params.id)
-      .populate("supplier", "name contact balance")
-      .populate("items.product", "name category sellingPrice")
-      .populate("buyer", "name")
-      .populate("destinedStore", "name type");
-
+    const achat = await Purchase.findById(req.params.id).populate(
+      "supplier items.product buyer destinedStore",
+    );
     if (!achat) return responseHandler.notFound(res, "Achat introuvable");
     return responseHandler.ok(res, achat);
   } catch (error) {
-    return responseHandler.error(
-      res,
-      "Erreur de récupération",
-      500,
-      error.message,
-    );
+    return responseHandler.error(res, "Erreur détails", 500, error.message);
   }
 };
 
 /**
- * 4. MISE À JOUR MULTIPLE (Quantités, Prix, Items, Boutique, Description)
- * - Gère le transfert de stock si la boutique de destination change.
+ * 4. MISE À JOUR (MODIFICATION)
  */
 export const updateAchat = async (req, res) => {
   const session = await mongoose.startSession();
@@ -171,109 +163,67 @@ export const updateAchat = async (req, res) => {
 
   try {
     const { id } = req.params;
-    const { items, description, destinedStore } = req.body;
-
-    // 1. Récupérer l'état actuel de l'achat avant modif
+    const { items, destinedStore } = req.body;
     const oldPurchase = await Purchase.findById(id).session(session);
-    if (!oldPurchase) return responseHandler.notFound(res, "Achat introuvable");
+    if (!oldPurchase) throw new Error("Achat introuvable");
 
-    const oldTotal = oldPurchase.totalAmount;
-    const oldStoreId = oldPurchase.destinedStore;
-    // Déterminer la nouvelle boutique (si fournie, sinon garder l'ancienne)
-    const newStoreId = destinedStore || oldStoreId;
+    const caisse = await CaisseGenerale.findOne().session(session);
 
-    // A. ANNULER L'ANCIEN STOCK (sur l'ancienne boutique)
-    for (const oldItem of oldPurchase.items) {
+    // Annulation financier et stock ancien
+    const oldTotal = oldPurchase.items.reduce(
+      (acc, i) => acc + i.quantity * i.unitPurchasePrice,
+      0,
+    );
+    for (const item of oldPurchase.items) {
       await Store.updateOne(
-        { _id: oldStoreId, "items.product": oldItem.product },
-        { $inc: { "items.$.quantityCartons": -oldItem.quantity } },
+        { _id: oldPurchase.destinedStore, "items.product": item.product },
+        { $inc: { "items.$.quantityCartons": -item.quantity } },
         { session },
       );
     }
 
-    // B. METTRE À JOUR LES DONNÉES DE L'ACHAT
-    oldPurchase.items = items.map((item) => ({
-      product: item.product?._id || item.product,
-      quantity: Number(item.quantity),
-      unitPurchasePrice: Number(item.unitPurchasePrice),
+    // Préparation nouveau calcul
+    const newItems = items.map((i) => ({
+      product: i.product?._id || i.product,
+      quantity: Number(i.quantity),
+      unitPurchasePrice: Number(i.unitPurchasePrice),
     }));
-
-    if (description) oldPurchase.description = description;
-    oldPurchase.destinedStore = newStoreId; // Mise à jour de la boutique
-
-    // Sauvegarde (déclenche le middleware pre-save pour recalculer totalAmount)
-    await oldPurchase.save({ session });
-
-    // C. APPLIQUER LE NOUVEAU STOCK (sur la nouvelle boutique)
-    for (const newItem of oldPurchase.items) {
-      const updateRes = await Store.updateOne(
-        { _id: newStoreId, "items.product": newItem.product },
-        { $inc: { "items.$.quantityCartons": newItem.quantity } },
-        { session },
-      );
-
-      // Si le produit n'existe pas encore dans la nouvelle boutique, on le crée
-      if (updateRes.matchedCount === 0) {
-        await Store.updateOne(
-          { _id: newStoreId },
-          {
-            $push: {
-              items: {
-                product: newItem.product,
-                quantityCartons: newItem.quantity,
-              },
-            },
-          },
-          { session },
-        );
-      }
-    }
-
-    // D. AJUSTER LES FINANCES
-    const diffTotal = oldPurchase.totalAmount - oldTotal;
-
-    // Ajuster solde fournisseur
-    await Supplier.findByIdAndUpdate(
-      oldPurchase.supplier,
-      { $inc: { balance: diffTotal } },
-      { session },
+    const newTotal = newItems.reduce(
+      (acc, i) => acc + i.quantity * i.unitPurchasePrice,
+      0,
     );
 
-    // Mettre à jour la dépense associée
-    if (oldPurchase.depenseId) {
-      const storeLabel = await Store.findById(newStoreId).select("name");
-      await Depense.findByIdAndUpdate(
-        oldPurchase.depenseId,
-        {
-          amount: oldPurchase.totalAmount,
-          label: `Achat marchandises - ${storeLabel?.name || "Boutique"}`,
-          note: `MODIFIÉ LE ${new Date().toLocaleDateString()} (Transfert Boutique incl.)`,
-        },
+    // Ajustement Caisse
+    const diff = newTotal - oldTotal;
+    if (caisse.soldeActuel < diff) throw new Error("Solde caisse insuffisant");
+    caisse.soldeActuel -= diff;
+    await caisse.save({ session });
+
+    // Application nouveau stock
+    oldPurchase.items = newItems;
+    oldPurchase.destinedStore = destinedStore || oldPurchase.destinedStore;
+    await oldPurchase.save({ session });
+
+    for (const item of newItems) {
+      await Store.updateOne(
+        { _id: oldPurchase.destinedStore, "items.product": item.product },
+        { $inc: { "items.$.quantityCartons": item.quantity } },
         { session },
       );
     }
 
     await session.commitTransaction();
-    return responseHandler.ok(
-      res,
-      oldPurchase,
-      "Achat et stocks (transfert inclus) mis à jour",
-    );
+    return responseHandler.ok(res, oldPurchase, "Achat mis à jour");
   } catch (error) {
     await session.abortTransaction();
-    return responseHandler.error(
-      res,
-      "Erreur mise à jour et transfert",
-      500,
-      error.message,
-    );
+    return responseHandler.error(res, error.message, 500);
   } finally {
     session.endSession();
   }
 };
 
 /**
- * 5. SUPPRIMER UN ACHAT COMPLET (Annulation)
+ * 5. SUPPRIMER UN ACHAT COMPLET
  */
 export const deleteAchat = async (req, res) => {
   const session = await mongoose.startSession();
@@ -281,9 +231,18 @@ export const deleteAchat = async (req, res) => {
 
   try {
     const achat = await Purchase.findById(req.params.id).session(session);
-    if (!achat) return responseHandler.notFound(res, "Achat introuvable");
+    if (!achat) throw new Error("Achat introuvable");
 
-    // Retrait du stock et ajustement solde
+    const caisse = await CaisseGenerale.findOne().session(session);
+    const totalARestituer = achat.items.reduce(
+      (acc, i) => acc + i.quantity * i.unitPurchasePrice,
+      0,
+    );
+
+    // Restitution
+    caisse.soldeActuel += totalARestituer;
+    await caisse.save({ session });
+
     for (const item of achat.items) {
       await Store.updateOne(
         { _id: achat.destinedStore, "items.product": item.product },
@@ -292,21 +251,19 @@ export const deleteAchat = async (req, res) => {
       );
     }
 
-    await Supplier.findByIdAndUpdate(
-      achat.supplier,
-      { $inc: { balance: -achat.totalAmount } },
-      { session },
-    );
-
     if (achat.depenseId)
       await Depense.findByIdAndDelete(achat.depenseId, { session });
     await Purchase.findByIdAndDelete(req.params.id, { session });
 
     await session.commitTransaction();
-    return responseHandler.ok(res, null, "Achat annulé et stocks restaurés");
+    return responseHandler.ok(
+      res,
+      null,
+      "Achat supprimé, stock et caisse rétablis",
+    );
   } catch (error) {
     await session.abortTransaction();
-    return responseHandler.error(res, "Erreur suppression", 500, error.message);
+    return responseHandler.error(res, error.message, 500);
   } finally {
     session.endSession();
   }
@@ -322,56 +279,36 @@ export const deleteOneProductAchat = async (req, res) => {
   try {
     const { achatId, productId } = req.params;
     const achat = await Purchase.findById(achatId).session(session);
-    if (!achat) return responseHandler.notFound(res, "Achat introuvable");
+    if (!achat) throw new Error("Achat introuvable");
 
     const itemIndex = achat.items.findIndex(
       (p) => p.product.toString() === productId,
     );
-    if (itemIndex === -1)
-      return responseHandler.notFound(
-        res,
-        "Produit non présent dans cet achat",
-      );
+    if (itemIndex === -1) throw new Error("Produit non trouvé dans cet achat");
 
     const item = achat.items[itemIndex];
-    const amountToSubtract = item.quantity * item.unitPurchasePrice;
+    const amountToRestituer = item.quantity * item.unitPurchasePrice;
 
-    // Mise à jour Stock et Fournisseur
+    // Restitution Caisse
+    const caisse = await CaisseGenerale.findOne().session(session);
+    caisse.soldeActuel += amountToRestituer;
+    await caisse.save({ session });
+
+    // Mise à jour stock
     await Store.updateOne(
       { _id: achat.destinedStore, "items.product": productId },
       { $inc: { "items.$.quantityCartons": -item.quantity } },
       { session },
     );
-    await Supplier.findByIdAndUpdate(
-      achat.supplier,
-      { $inc: { balance: -amountToSubtract } },
-      { session },
-    );
 
-    // Retrait de l'item du tableau
     achat.items.splice(itemIndex, 1);
-
-    if (achat.items.length === 0) {
-      // Si plus de produits, on supprime l'achat
-      if (achat.depenseId)
-        await Depense.findByIdAndDelete(achat.depenseId, { session });
-      await Purchase.findByIdAndDelete(achatId, { session });
-    } else {
-      await achat.save({ session });
-      if (achat.depenseId) {
-        await Depense.findByIdAndUpdate(
-          achat.depenseId,
-          { amount: achat.totalAmount },
-          { session },
-        );
-      }
-    }
+    await achat.save({ session });
 
     await session.commitTransaction();
-    return responseHandler.ok(res, achat, "Produit retiré de l'achat");
+    return responseHandler.ok(res, achat, "Produit retiré avec succès");
   } catch (error) {
     await session.abortTransaction();
-    return responseHandler.error(res, "Erreur", 500, error.message);
+    return responseHandler.error(res, error.message, 500);
   } finally {
     session.endSession();
   }

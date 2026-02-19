@@ -24,7 +24,7 @@ const StockHistorySchema = new Schema(
     },
     type: {
       type: String,
-      enum: ["transfert", "retour", "perte", "ajustement", "achat"],
+      enum: ["transfert", "retour", "perte", "ajustement", "achat", "vente"],
       required: true,
     },
     description: {

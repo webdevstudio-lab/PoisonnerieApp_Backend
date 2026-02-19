@@ -4,15 +4,17 @@ const SaleSchema = new Schema(
   {
     name: { type: String, required: true },
     location: { type: String },
-    // Uniquement le stock "ouvert" pour la vente au détail/client
     displayStock: [
       {
         product: { type: Schema.Types.ObjectId, ref: "Product" },
-        cartons: { type: Number, default: 0, min: 0 }, // Cartons entiers dans le frigo
-        kilograms: { type: Number, default: 0, min: 0 }, // Détail (ex: 5.5 kg restants)
+        cartons: { type: Number, default: 0, min: 0 },
+        kilograms: { type: Number, default: 0, min: 0 },
       },
     ],
-    solde: { type: Number, default: 0 },
+    solde: { type: Number, default: 0 }, // Argent actuellement en caisse boutique
+
+    // NOUVEAU : Ce que la boutique doit au propriétaire (Dette de transfert)
+    totalDebtToOwner: { type: Number, default: 0 },
   },
   { timestamps: true },
 );

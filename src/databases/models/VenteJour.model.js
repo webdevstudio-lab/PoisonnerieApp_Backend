@@ -7,16 +7,21 @@ const VenteJourSchema = new Schema(
       ref: "Sale",
       required: true,
     },
+    store: {
+      // La boutique (stock secondaire) concernée
+      type: Schema.Types.ObjectId,
+      ref: "Store",
+      required: true,
+    },
     vendeur: {
       type: Schema.Types.ObjectId,
       ref: "User",
       required: true,
     },
     date: {
-      type: String,
-      default: () => new Date().toLocaleDateString("fr-FR"),
+      type: Date, // Changé en Date pour faciliter les requêtes par période
+      default: Date.now,
     },
-    // Le tableau des produits vendus durant la journée
     inventorySold: [
       {
         product: {
@@ -24,20 +29,13 @@ const VenteJourSchema = new Schema(
           ref: "Product",
           required: true,
         },
-        productName: String,
-        // Vente en cartons entiers
-        cartonsSold: { type: Number, default: 0 },
-        priceCartons: { type: Number, default: 0 },
-        // Vente au détail (kilogrammes)
-        kgSold: { type: Number, default: 0 },
-        priceKg: { type: Number, default: 0 },
-        // Total pour ce produit précis (facultatif car calculable)
-        subTotal: { type: Number, default: 0 },
+        cartonsSold: { type: Number, required: true },
+        unitPrice: { type: Number, required: true }, // Prix de vente au moment de la transaction
+        subTotal: { type: Number, required: true },
       },
     ],
-    totalDayCash: { type: Number, required: true }, // Argent total encaissé
-    totalDayCredit: { type: Number, default: 0 }, // Montant total des dettes clients du jour
-    observation: { type: String }, // Pour signaler des pertes ou soucis
+    totalAmount: { type: Number, required: true }, // Somme totale des subTotals
+    observation: { type: String },
   },
   { timestamps: true },
 );
