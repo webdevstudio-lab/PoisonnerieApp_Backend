@@ -1,8 +1,6 @@
 import {
   CaisseGenerale,
   Depense,
-  Product,
-  Sale,
   HistoriqueCaisseGenerale,
   VenteJour,
   Store,
@@ -14,10 +12,10 @@ export const GetDashboardStats = async (req, res) => {
     const selectedYear = parseInt(req.query.year) || new Date().getFullYear();
     const now = new Date();
 
-    // Dates pour les KPIs (Mois en cours)
+    // Dates pour les KPIs (Début du mois en cours)
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
 
-    // Plage de dates pour le graphique (L'année sélectionnée entière)
+    // Plage de dates pour le graphique (Année entière)
     const startOfSelectedYear = new Date(selectedYear, 0, 1);
     const endOfSelectedYear = new Date(selectedYear, 11, 31, 23, 59, 59);
 
@@ -30,29 +28,35 @@ export const GetDashboardStats = async (req, res) => {
       evolutionVentes,
       evolutionDepenses,
     ] = await Promise.all([
+      // 1. Solde actuel de la caisse
       CaisseGenerale.findOne().select("soldeActuel"),
 
+      // 2. Total dépenses du mois en cours
       Depense.aggregate([
         { $match: { createdAt: { $gte: startOfMonth } } },
         { $group: { _id: null, total: { $sum: "$amount" } } },
       ]),
 
+      // 3. Total ventes du mois en cours
       VenteJour.aggregate([
         { $match: { date: { $gte: startOfMonth } } },
-        { $group: { _id: null, total: { $sum: "$totalJournalier" } } },
+        { $group: { _id: null, total: { $sum: "$totalAmount" } } }, // Changé totalJournalier -> totalAmount
       ]),
 
+      // 4. Alertes de stock
       Store.find()
         .populate("salePoint", "name")
         .populate("items.product", "name lowStockThreshold")
         .lean(),
 
+      // 5. Historique récent
       HistoriqueCaisseGenerale.find()
         .sort({ createdAt: -1 })
         .limit(5)
         .populate("effectuePar", "name")
         .populate("boutiqueSource", "name"),
 
+      // 6. Évolution des ventes (Annuelle)
       VenteJour.aggregate([
         {
           $match: {
@@ -62,11 +66,12 @@ export const GetDashboardStats = async (req, res) => {
         {
           $group: {
             _id: { month: { $month: "$date" } },
-            total: { $sum: "$totalJournalier" },
+            total: { $sum: "$totalAmount" }, // Changé totalJournalier -> totalAmount
           },
         },
       ]),
 
+      // 7. Évolution des dépenses (Annuelle)
       Depense.aggregate([
         {
           $match: {
@@ -100,7 +105,7 @@ export const GetDashboardStats = async (req, res) => {
       });
     });
 
-    // Formatage du graphique pour les 12 mois de l'année sélectionnée
+    // Formatage du graphique (12 mois)
     const moisLabels = [
       "Jan",
       "Fév",
@@ -115,30 +120,40 @@ export const GetDashboardStats = async (req, res) => {
       "Nov",
       "Déc",
     ];
+
     const graphiqueData = moisLabels.map((label, index) => {
       const monthNum = index + 1;
+      const ventePourMois = evolutionVentes.find(
+        (v) => v._id.month === monthNum,
+      );
+      const depensePourMois = evolutionDepenses.find(
+        (d) => d._id.month === monthNum,
+      );
+
       return {
         name: label,
-        ventes:
-          evolutionVentes.find((v) => v._id.month === monthNum)?.total || 0,
-        depenses:
-          evolutionDepenses.find((d) => d._id.month === monthNum)?.total || 0,
+        ventes: ventePourMois ? ventePourMois.total : 0,
+        depenses: depensePourMois ? depensePourMois.total : 0,
       };
     });
+
+    // Calcul des montants KPIs
+    const totalVentesMois = ventesMois[0]?.total || 0;
+    const totalDepensesMois = depensesMois[0]?.total || 0;
 
     return responseHandler.ok(res, {
       kpis: {
         soldeCaisse: caisse?.soldeActuel || 0,
-        ventesMois: ventesMois[0]?.total || 0,
-        depensesMois: depensesMois[0]?.total || 0,
-        beneficeNet:
-          (ventesMois[0]?.total || 0) - (depensesMois[0]?.total || 0),
+        ventesMois: totalVentesMois,
+        depensesMois: totalDepensesMois,
+        beneficeNet: totalVentesMois - totalDepensesMois,
       },
       alertes: alertesFormatees.slice(0, 5),
       mouvements: derniersMouvements,
       graphique: graphiqueData,
     });
   } catch (error) {
+    console.error("Dashboard Error:", error);
     return responseHandler.error(res, "Erreur Dashboard", 500, error.message);
   }
 };

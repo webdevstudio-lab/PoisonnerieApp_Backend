@@ -8,23 +8,28 @@ import {
 import responseHandler from "../utils/responseHandler.js";
 import mongoose from "mongoose";
 
-/**
- * 1. AJOUTER UNE VENTE DU JOUR
- */
 export const addVenteJour = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
 
   try {
-    const { items, storeId, salePointId, date, observation } = req.body;
+    const {
+      items,
+      storeId,
+      salePointId,
+      date,
+      observation,
+      isCredit,
+      clientId,
+    } = req.body;
     const sellerId = req.user?._id;
 
-    if (!items || !Array.isArray(items) || items.length === 0)
-      throw new Error("Aucun produit sélectionné.");
+    if (!items?.length) throw new Error("Aucun produit sélectionné.");
 
     let totalVente = 0;
     const inventorySold = [];
 
+    // --- PHASE 1 : CALCUL ET DÉDUCTION STOCKS ---
     for (const item of items) {
       const productId = item.productId || item.product;
       const qty = Math.abs(Number(item.cartonsSold));
@@ -42,7 +47,6 @@ export const addVenteJour = async (req, res) => {
         subTotal: subTotal,
       });
 
-      // Déduction du stock avec vérification de disponibilité
       const updatedStore = await Store.findOneAndUpdate(
         {
           _id: storeId,
@@ -54,22 +58,57 @@ export const addVenteJour = async (req, res) => {
       );
 
       if (!updatedStore)
-        throw new Error(`Stock insuffisant pour le produit : ${product.name}`);
+        throw new Error(`Stock insuffisant pour : ${product.name}`);
 
       await new StockHistory({
         product: product._id,
         fromStore: storeId,
         quantity: qty,
         type: "vente",
-        description: `Vente journalière du ${new Date(date || Date.now()).toLocaleDateString()}`,
+        description: `Vente ${isCredit ? "CRÉDIT" : "CASH"} du ${new Date(date || Date.now()).toLocaleDateString()}`,
         userId: sellerId,
       }).save({ session });
     }
 
+    // --- PHASE 2 : GESTION FINANCIÈRE (CRÉDIT VS CASH) ---
+    if (isCredit) {
+      if (!clientId) throw new Error("Client requis pour une vente à crédit.");
+      const client = await Client.findById(clientId).session(session);
+
+      if (!client) throw new Error("Client introuvable.");
+      if (client.isRestricted)
+        throw new Error(`Client bloqué: ${client.restrictionReason}`);
+      if (client.currentDebt + totalVente > client.creditLimit) {
+        throw new Error(
+          `Limite de crédit dépassée (Max: ${client.creditLimit})`,
+        );
+      }
+
+      await Client.findByIdAndUpdate(
+        clientId,
+        { $inc: { currentDebt: totalVente } },
+        { session },
+      );
+      await Sale.findByIdAndUpdate(
+        salePointId,
+        { $inc: { impayer: totalVente } },
+        { session },
+      );
+    } else {
+      await Sale.findByIdAndUpdate(
+        salePointId,
+        { $inc: { solde: totalVente } },
+        { session },
+      );
+    }
+
+    // --- PHASE 3 : SAUVEGARDE ---
     const newVenteJour = new VenteJour({
       salePoint: salePointId,
       store: storeId,
       vendeur: sellerId,
+      isCredit: !!isCredit,
+      client: isCredit ? clientId : null,
       date: date || new Date(),
       inventorySold,
       totalAmount: totalVente,
@@ -77,24 +116,16 @@ export const addVenteJour = async (req, res) => {
     });
 
     await newVenteJour.save({ session });
-
-    // Mise à jour du solde de la boutique
-    await Sale.findByIdAndUpdate(
-      salePointId,
-      { $inc: { solde: totalVente } },
-      { session },
-    );
-
     await session.commitTransaction();
 
-    const populatedVente = await VenteJour.findById(newVenteJour._id)
+    const result = await VenteJour.findById(newVenteJour._id)
       .populate("vendeur", "name")
-      .populate("salePoint", "name")
+      .populate("client", "name")
       .populate("inventorySold.product", "name");
 
     return responseHandler.created(
       res,
-      populatedVente,
+      result,
       "Vente enregistrée avec succès",
     );
   } catch (error) {
@@ -106,11 +137,7 @@ export const addVenteJour = async (req, res) => {
 };
 
 /**
- * 2. MODIFIER UNE VENTE DU JOUR (CORRECTION FATALE)
- * Méthode : Restitution totale de l'ancienne vente -> Vérification nouvelle vente -> Application
- */
-/**
- * 2. MODIFIER UNE VENTE DU JOUR (CORRECTIF SÉCURITÉ STOCK)
+ * 2. MODIFIER UNE VENTE (RECALCUL COMPLET)
  */
 export const updateVenteJour = async (req, res) => {
   const session = await mongoose.startSession();
@@ -118,57 +145,55 @@ export const updateVenteJour = async (req, res) => {
 
   try {
     const { id } = req.params;
-    const { items, storeId, salePointId, observation, date } = req.body;
-    const userId = req.user?._id;
+    const {
+      items,
+      storeId,
+      salePointId,
+      observation,
+      date,
+      isCredit,
+      clientId,
+    } = req.body;
 
     const oldVente = await VenteJour.findById(id).session(session);
     if (!oldVente) throw new Error("Vente introuvable");
 
-    const targetStoreId = storeId || oldVente.store;
-    const targetSalePointId = salePointId || oldVente.salePoint;
-
-    // --- ETAPE 1 : RÉCUPÉRER L'ÉTAT ACTUEL DU STOCK ---
-    const currentStore = await Store.findById(targetStoreId).session(session);
-    if (!currentStore) throw new Error("Entrepôt introuvable");
-
-    // --- ETAPE 2 : CALCULER LE STOCK VIRTUEL (Stock actuel + Restitution) ---
-    // On crée une copie de travail du stock pour simuler la modification
-    let virtualStock = [...currentStore.items];
-
-    // On restitue virtuellement les anciens articles
-    for (const oldItem of oldVente.inventorySold) {
-      const stockIdx = virtualStock.findIndex(
-        (s) => s.product.toString() === oldItem.product.toString(),
+    // --- ÉTAPE 1 : ANNULER L'ANCIENNE VENTE (Stock + Finances) ---
+    for (const item of oldVente.inventorySold) {
+      await Store.updateOne(
+        { _id: oldVente.store, "items.product": item.product },
+        { $inc: { "items.$.quantityCartons": item.cartonsSold } },
+        { session },
       );
-      if (stockIdx !== -1) {
-        virtualStock[stockIdx].quantityCartons += oldItem.cartonsSold;
-      }
+    }
+    if (oldVente.isCredit) {
+      await Client.findByIdAndUpdate(
+        oldVente.client,
+        { $inc: { currentDebt: -oldVente.totalAmount } },
+        { session },
+      );
+      await Sale.findByIdAndUpdate(
+        oldVente.salePoint,
+        { $inc: { impayer: -oldVente.totalAmount } },
+        { session },
+      );
+    } else {
+      await Sale.findByIdAndUpdate(
+        oldVente.salePoint,
+        { $inc: { solde: -oldVente.totalAmount } },
+        { session },
+      );
     }
 
-    // --- ETAPE 3 : VÉRIFIER LA FAISABILITÉ DE LA NOUVELLE VENTE ---
+    // --- ÉTAPE 2 : APPLIQUER LA NOUVELLE VENTE (Logique similaire à addVenteJour) ---
+    // Note: Pour simplifier, on recalcule tout sur la base des nouveaux items
     let newTotalVente = 0;
     const newInventorySold = [];
 
     for (const item of items) {
       const productId = item.productId || item.product;
       const qty = Math.abs(Number(item.cartonsSold));
-
       const product = await Product.findById(productId).session(session);
-      if (!product) throw new Error(`Produit introuvable en base`);
-
-      // Vérification dans le stock virtuel
-      const vStockItem = virtualStock.find(
-        (s) => s.product.toString() === productId.toString(),
-      );
-
-      if (!vStockItem || vStockItem.quantityCartons < qty) {
-        throw new Error(
-          `Stock insuffisant pour ${product.name}. Disponible après restitution : ${vStockItem ? vStockItem.quantityCartons : 0}`,
-        );
-      }
-
-      // Mise à jour du stock virtuel pour les items suivants (au cas où le même produit est cité 2 fois)
-      vStockItem.quantityCartons -= qty;
 
       const subTotal = qty * product.sellingPrice;
       newTotalVente += subTotal;
@@ -177,56 +202,53 @@ export const updateVenteJour = async (req, res) => {
         product: product._id,
         cartonsSold: qty,
         unitPrice: product.sellingPrice,
-        subTotal: subTotal,
+        subTotal,
       });
+
+      const updatedStore = await Store.findOneAndUpdate(
+        {
+          _id: storeId || oldVente.store,
+          "items.product": product._id,
+          "items.quantityCartons": { $gte: qty },
+        },
+        { $inc: { "items.$.quantityCartons": -qty } },
+        { session, new: true },
+      );
+      if (!updatedStore)
+        throw new Error(`Stock insuffisant pour ${product.name}`);
     }
 
-    // --- ETAPE 4 : SI TOUT EST OK, APPLIQUER RÉELLEMENT ---
-
-    // A. Appliquer la restitution réelle sur le Store
-    for (const oldItem of oldVente.inventorySold) {
-      await Store.updateOne(
-        { _id: oldVente.store, "items.product": oldItem.product },
-        { $inc: { "items.$.quantityCartons": oldItem.cartonsSold } },
+    // --- ÉTAPE 3 : NOUVELLE GESTION FINANCIÈRE ---
+    if (isCredit) {
+      await Client.findByIdAndUpdate(
+        clientId,
+        { $inc: { currentDebt: newTotalVente } },
+        { session },
+      );
+      await Sale.findByIdAndUpdate(
+        salePointId,
+        { $inc: { impayer: newTotalVente } },
+        { session },
+      );
+    } else {
+      await Sale.findByIdAndUpdate(
+        salePointId,
+        { $inc: { solde: newTotalVente } },
         { session },
       );
     }
 
-    // B. Appliquer les nouvelles déductions sur le Store
-    for (const newItem of newInventorySold) {
-      await Store.updateOne(
-        { _id: targetStoreId, "items.product": newItem.product },
-        { $inc: { "items.$.quantityCartons": -newItem.cartonsSold } },
-        { session },
-      );
-    }
-
-    // C. Ajuster le solde de la boutique (Ancien vs Nouveau)
-    const diffSolde = newTotalVente - oldVente.totalAmount;
-    await Sale.findByIdAndUpdate(
-      targetSalePointId,
-      { $inc: { solde: diffSolde } },
-      { session },
-    );
-
-    // D. Mettre à jour le document de vente
     oldVente.inventorySold = newInventorySold;
     oldVente.totalAmount = newTotalVente;
+    oldVente.isCredit = isCredit;
+    oldVente.client = isCredit ? clientId : null;
     oldVente.observation = observation || oldVente.observation;
     oldVente.date = date || oldVente.date;
-    oldVente.store = targetStoreId;
-    oldVente.salePoint = targetSalePointId;
 
     await oldVente.save({ session });
-
     await session.commitTransaction();
 
-    const result = await VenteJour.findById(id)
-      .populate("vendeur", "name")
-      .populate("salePoint", "name")
-      .populate("inventorySold.product", "name");
-
-    return responseHandler.ok(res, result, "Mise à jour sécurisée réussie");
+    return responseHandler.ok(res, oldVente, "Mise à jour réussie");
   } catch (error) {
     await session.abortTransaction();
     return responseHandler.error(res, error.message, 500);
@@ -236,7 +258,7 @@ export const updateVenteJour = async (req, res) => {
 };
 
 /**
- * 3. SUPPRIMER UNE VENTE DU JOUR
+ * 3. SUPPRIMER UNE VENTE
  */
 export const deleteVenteJour = async (req, res) => {
   const session = await mongoose.startSession();
@@ -247,35 +269,37 @@ export const deleteVenteJour = async (req, res) => {
     const vente = await VenteJour.findById(id).session(session);
     if (!vente) throw new Error("Vente introuvable");
 
-    // Restitution des stocks
     for (const item of vente.inventorySold) {
       await Store.updateOne(
         { _id: vente.store, "items.product": item.product },
         { $inc: { "items.$.quantityCartons": item.cartonsSold } },
         { session },
       );
-
-      await new StockHistory({
-        product: item.product,
-        fromStore: vente.store,
-        quantity: item.cartonsSold,
-        type: "retour",
-        description: `Annulation vente #${id.slice(-6)}`,
-        userId: req.user?._id,
-      }).save({ session });
     }
 
-    // Déduction du montant du solde de la boutique
-    await Sale.findByIdAndUpdate(
-      vente.salePoint,
-      { $inc: { solde: -vente.totalAmount } },
-      { session },
-    );
+    if (vente.isCredit) {
+      await Client.findByIdAndUpdate(
+        vente.client,
+        { $inc: { currentDebt: -vente.totalAmount } },
+        { session },
+      );
+      await Sale.findByIdAndUpdate(
+        vente.salePoint,
+        { $inc: { impayer: -vente.totalAmount } },
+        { session },
+      );
+    } else {
+      await Sale.findByIdAndUpdate(
+        vente.salePoint,
+        { $inc: { solde: -vente.totalAmount } },
+        { session },
+      );
+    }
 
     await VenteJour.findByIdAndDelete(id, { session });
-
     await session.commitTransaction();
-    return responseHandler.ok(res, null, "Vente supprimée avec succès");
+
+    return responseHandler.ok(res, null, "Vente supprimée et comptes ajustés");
   } catch (error) {
     await session.abortTransaction();
     return responseHandler.error(res, error.message, 500);

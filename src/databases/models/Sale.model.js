@@ -12,6 +12,7 @@ const SaleSchema = new Schema(
       },
     ],
     solde: { type: Number, default: 0 }, // Argent actuellement en caisse boutique
+    impayer: { type: Number, default: 0 },
 
     // NOUVEAU : Ce que la boutique doit au propriétaire (Dette de transfert)
     totalDebtToOwner: { type: Number, default: 0 },
